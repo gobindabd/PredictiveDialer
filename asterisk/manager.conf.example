@@ -1,0 +1,26 @@
+; Asterisk Manager Interface (AMI) configuration for the predictive dialer.
+; Place this file at /etc/asterisk/manager.conf
+; After changes: asterisk -rx "manager reload"
+
+[general]
+enabled = yes
+port = 5038
+bindaddr = 127.0.0.1
+; Disable the HTTP management interface — AMI over TCP is sufficient.
+httpenabled = no
+; Do not log every connect/disconnect in the Asterisk console.
+displayconnects = no
+
+; ---------------------------------------------------------------------------
+; Predictive dialer engine account.
+; Set AMI_USERNAME and AMI_PASSWORD in .env to match the values below.
+; ---------------------------------------------------------------------------
+[predictive_engine]
+secret = change-this-to-a-strong-secret
+; Read permissions required for call/event tracking:
+read = system,call,log,verbose,command,agent,user,dtmf,reporting,cdr,dialplan
+; Write permissions required for originating calls:
+write = system,call,command,originate,reporting
+; Only allow connections from localhost (where the PHP engine runs).
+permit = 127.0.0.1/255.255.255.255
+deny = 0.0.0.0/0.0.0.0

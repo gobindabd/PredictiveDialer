@@ -1,0 +1,23 @@
+[predictive-outbound]
+exten => _X.,1,NoOp(Predictive outbound to ${EXTEN} via ${TRUNK_NAME})
+ same => n,Set(__CALL_ID=${CALL_ID})
+ same => n,Set(__LEAD_ID=${LEAD_ID})
+ same => n,Set(__CAMPAIGN_ID=${CAMPAIGN_ID})
+ same => n,Dial(PJSIP/${EXTEN}@${TRUNK_NAME},30,g)
+ same => n,Hangup()
+
+[predictive-call]
+exten => s,1,NoOp(Predictive answered call CALL_ID=${CALL_ID})
+ same => n,Answer()
+ same => n,UserEvent(PredictiveAnswered,CallId:${CALL_ID},LeadId:${LEAD_ID},CampaignId:${CAMPAIGN_ID})
+ same => n,Set(TIMEOUT(digit)=5)
+ same => n,Set(TIMEOUT(response)=10)
+ same => n,GotoIf($["${PROMPT_FILE}" = ""]?collect)
+ same => n,Playback(${PROMPT_FILE})
+ same => n(collect),Read(USER_DIGIT,,1,,1,10)
+ same => n,GotoIf($["${USER_DIGIT}" = ""]?noinput)
+ same => n,UserEvent(PredictiveDtmf,CallId:${CALL_ID},LeadId:${LEAD_ID},Digit:${USER_DIGIT})
+ same => n,Playback(thank-you)
+ same => n,Hangup()
+ same => n(noinput),UserEvent(PredictiveNoDtmf,CallId:${CALL_ID},LeadId:${LEAD_ID})
+ same => n,Hangup()

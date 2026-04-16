@@ -1,0 +1,13 @@
+.env
+*.log
+.venv/
+vendor/
+node_modules/
+storage/uploads/csv/*
+storage/prompts/original/*
+storage/prompts/asterisk/*
+storage/logs/*
+!storage/uploads/csv/.gitkeep
+!storage/prompts/original/.gitkeep
+!storage/prompts/asterisk/.gitkeep
+!storage/logs/.gitkeep

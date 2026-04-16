@@ -1,0 +1,16 @@
+[Unit]
+Description=Predictive Dialer PHP Engine
+After=network.target mariadb.service asterisk.service
+
+[Service]
+Type=simple
+WorkingDirectory=/usr/src/software/project
+EnvironmentFile=/usr/src/software/project/.env
+ExecStart=/usr/bin/php /usr/src/software/project/web/bin/dialer-worker.php
+Restart=always
+RestartSec=5
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target
