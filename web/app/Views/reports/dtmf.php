@@ -72,6 +72,16 @@ $totalDuration = (int) ($summary['total_duration'] ?? 0);
 $totalYes      = (int) ($summary['total_yes']      ?? 0);
 $totalNo       = (int) ($summary['total_no']       ?? 0);
 
+// All-calls summary shorthand
+$acTotal     = (int) ($allSummary['total_calls']     ?? 0);
+$acAnswered  = (int) ($allSummary['answered_calls']  ?? 0);
+$acCompleted = (int) ($allSummary['completed_calls'] ?? 0);
+$acNoAnswer  = (int) ($allSummary['no_answer_calls'] ?? 0);
+$acBusy      = (int) ($allSummary['busy_calls']      ?? 0);
+$acFailed    = (int) ($allSummary['failed_calls']    ?? 0);
+$acDuration  = (int) ($allSummary['total_duration']  ?? 0);
+$acNoDtmf    = max(0, $acAnswered - $totalCalls);
+
 // Digit label lookup used in both table and filter dropdown
 $digitLabel = static function (string $digit): string {
     return match ($digit) {
@@ -158,6 +168,113 @@ $digitLabel = static function (string $digit): string {
             </a>
         </div>
     </form>
+</div>
+
+<!-- ── All Calls section ─────────────────────────────────────────────────── -->
+<div class="panel">
+    <div class="section-title mb-3">
+        <div>
+            <h2>All Calls</h2>
+            <p class="section-kicker">Every dialed call in the selected date range — regardless of key-press response</p>
+        </div>
+    </div>
+
+    <!-- Summary metrics -->
+    <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(150px,1fr)); gap:12px; margin-bottom:20px;">
+        <div class="metric" style="border-left:4px solid var(--accent);">
+            <strong><i class="bi bi-telephone-outbound me-1"></i>Total Dialed</strong>
+            <span><?= number_format($acTotal) ?></span>
+        </div>
+        <div class="metric" style="border-left:4px solid var(--ok);">
+            <strong><i class="bi bi-telephone-inbound me-1"></i>Answered</strong>
+            <span style="color:var(--ok);"><?= number_format($acAnswered) ?></span>
+            <div style="font-size:12px;color:var(--muted);margin-top:4px;">
+                <?= $acTotal > 0 ? number_format($acAnswered / $acTotal * 100, 1) . '%' : '—' ?>
+            </div>
+        </div>
+        <div class="metric" style="border-left:4px solid #f59e0b;">
+            <strong><i class="bi bi-telephone-minus me-1"></i>No Answer</strong>
+            <span style="color:#f59e0b;"><?= number_format($acNoAnswer) ?></span>
+        </div>
+        <div class="metric" style="border-left:4px solid #94a3b8;">
+            <strong><i class="bi bi-telephone-x me-1"></i>Busy</strong>
+            <span style="color:#94a3b8;"><?= number_format($acBusy) ?></span>
+        </div>
+        <div class="metric" style="border-left:4px solid var(--danger);">
+            <strong><i class="bi bi-exclamation-circle me-1"></i>Failed</strong>
+            <span style="color:var(--danger);"><?= number_format($acFailed) ?></span>
+        </div>
+        <div class="metric" style="border-left:4px solid #6c7d9e;">
+            <strong><i class="bi bi-clock me-1"></i>Total Duration</strong>
+            <span style="font-size:20px;"><?= htmlspecialchars($fmtDuration($acDuration)) ?></span>
+        </div>
+        <div class="metric" style="border-left:4px solid #c084fc;">
+            <strong><i class="bi bi-keyboard me-1"></i>No Key Pressed</strong>
+            <span style="color:#c084fc;"><?= number_format($acNoDtmf) ?></span>
+            <div style="font-size:12px;color:var(--muted);margin-top:4px;">answered, no DTMF</div>
+        </div>
+    </div>
+
+    <?php if (empty($allCallsRows)): ?>
+        <div class="soft-card text-center py-4">
+            <i class="bi bi-telephone-x fs-1 text-muted"></i>
+            <p class="subtle mt-2 mb-0">No calls found in the selected date range.</p>
+        </div>
+    <?php else: ?>
+        <div class="table-wrap">
+            <table class="table table-hover align-middle">
+                <thead>
+                    <tr>
+                        <th style="width:70px;">Lead ID</th>
+                        <th>Phone Number</th>
+                        <th>Name</th>
+                        <th>Campaign</th>
+                        <th>Dialed At</th>
+                        <th>Answered At</th>
+                        <th>End Time</th>
+                        <th>Duration</th>
+                        <th>Status</th>
+                        <th>Trunk</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php foreach ($allCallsRows as $row): ?>
+                        <tr>
+                            <td class="text-muted">#<?= (int) $row['lead_id'] ?></td>
+                            <td class="mono"><?= htmlspecialchars($row['phone_number']) ?></td>
+                            <td>
+                                <?php
+                                $name = trim(($row['first_name'] ?? '') . ' ' . ($row['last_name'] ?? ''));
+                                echo $name !== '' ? htmlspecialchars($name) : '<span class="text-muted">—</span>';
+                                ?>
+                            </td>
+                            <td><?= htmlspecialchars($row['campaign_name']) ?></td>
+                            <td class="mono"><?= htmlspecialchars($fmtDate($row['dialed_at'] ?? null)) ?></td>
+                            <td class="mono"><?= htmlspecialchars($fmtDate($row['answered_at'] ?? null)) ?></td>
+                            <td class="mono"><?= htmlspecialchars($fmtDate($row['ended_at'] ?? null)) ?></td>
+                            <td><?= htmlspecialchars($fmtDuration($row['billsec'] ?? 0)) ?></td>
+                            <td>
+                                <?php $cs = (string) ($row['call_status'] ?? ''); ?>
+                                <span class="status <?= htmlspecialchars($statusClass($cs)) ?>">
+                                    <?= htmlspecialchars(str_replace(['_', '-'], ' ', $cs) ?: '—') ?>
+                                </span>
+                            </td>
+                            <td>
+                                <?php if (!empty($row['trunk_name'])): ?>
+                                    <span class="badge text-bg-light border mono"><?= htmlspecialchars($row['trunk_name']) ?></span>
+                                <?php else: ?>
+                                    <span class="text-muted">—</span>
+                                <?php endif; ?>
+                            </td>
+                        </tr>
+                    <?php endforeach; ?>
+                </tbody>
+            </table>
+        </div>
+        <?php if (count($allCallsRows) >= 200): ?>
+            <p class="subtle mt-2" style="font-size:12px;">Showing the 200 most recent calls. Use date filters to narrow the range.</p>
+        <?php endif; ?>
+    <?php endif; ?>
 </div>
 
 <!-- ── Results table ────────────────────────────────────────────────────────── -->

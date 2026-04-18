@@ -28,6 +28,11 @@ class ReportController extends Controller
             $dateFrom, $dateTo, $campaignId, $dtmfDigit, $phoneSearch
         );
 
+        // All-calls WHERE (same date/campaign/phone filters, no DTMF filter)
+        [$callsWhere, $callsParams] = $this->buildCallsWhere(
+            $dateFrom, $dateTo, $campaignId, $phoneSearch
+        );
+
         $campaigns = $this->db->fetchAll(
             'SELECT id, name FROM campaigns ORDER BY name'
         );
@@ -36,6 +41,48 @@ class ReportController extends Controller
             $this->exportCsv($whereSql, $params);
             return;
         }
+
+        // ── All-calls summary (answered/no_answer/failed regardless of DTMF) ──
+        $allSummary = $this->db->fetch(
+            "SELECT
+                COUNT(*)                                        AS total_calls,
+                COALESCE(SUM(ca.answered_at IS NOT NULL), 0)   AS answered_calls,
+                COALESCE(SUM(ca.status = 'completed'), 0)      AS completed_calls,
+                COALESCE(SUM(ca.status = 'no_answer'), 0)      AS no_answer_calls,
+                COALESCE(SUM(ca.status = 'busy'), 0)           AS busy_calls,
+                COALESCE(SUM(ca.status IN ('failed')), 0)      AS failed_calls,
+                COALESCE(SUM(ca.billsec), 0)                   AS total_duration
+             FROM calls ca
+             JOIN leads      l ON l.id  = ca.lead_id
+             JOIN campaigns  c ON c.id  = ca.campaign_id
+             LEFT JOIN vendors v ON v.id = ca.vendor_id
+             $callsWhere",
+            $callsParams
+        ) ?: [];
+
+        // ── All-calls rows (most recent 200, no DTMF join required) ───────────
+        $allCallsRows = $this->db->fetchAll(
+            "SELECT
+                l.id            AS lead_id,
+                l.phone_number,
+                l.first_name,
+                l.last_name,
+                c.name          AS campaign_name,
+                ca.dialed_at,
+                ca.answered_at,
+                ca.ended_at,
+                ca.billsec,
+                ca.status       AS call_status,
+                v.trunk_name
+             FROM calls ca
+             JOIN leads      l ON l.id  = ca.lead_id
+             JOIN campaigns  c ON c.id  = ca.campaign_id
+             LEFT JOIN vendors v ON v.id = ca.vendor_id
+             $callsWhere
+             ORDER BY ca.dialed_at DESC
+             LIMIT 200",
+            $callsParams
+        );
 
         // ── Aggregate summary (full filtered set, not just current page) ──────
         // Groups by call_id so each call is counted once; MAX(billsec) avoids
@@ -107,24 +154,65 @@ class ReportController extends Controller
         );
 
         $this->view('reports/dtmf', [
-            'rows'        => $rows,
-            'summary'     => $summary,
-            'campaigns'   => $campaigns,
-            'total'       => $total,
-            'page'        => $page,
-            'perPage'     => self::PER_PAGE,
-            'totalPages'  => $totalPages,
-            'dateFrom'    => $dateFrom,
-            'dateTo'      => $dateTo,
-            'campaignId'  => $campaignId,
-            'dtmfDigit'   => $dtmfDigit,
-            'phoneSearch' => $phoneSearch,
+            'rows'         => $rows,
+            'summary'      => $summary,
+            'allSummary'   => $allSummary,
+            'allCallsRows' => $allCallsRows,
+            'campaigns'    => $campaigns,
+            'total'        => $total,
+            'page'         => $page,
+            'perPage'      => self::PER_PAGE,
+            'totalPages'   => $totalPages,
+            'dateFrom'     => $dateFrom,
+            'dateTo'       => $dateTo,
+            'campaignId'   => $campaignId,
+            'dtmfDigit'    => $dtmfDigit,
+            'phoneSearch'  => $phoneSearch,
         ]);
     }
 
     // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
+
+    /**
+     * WHERE clause for the calls table (no DTMF filter).
+     *
+     * @return array{0: string, 1: array<int, mixed>}
+     */
+    private function buildCallsWhere(
+        string $dateFrom,
+        string $dateTo,
+        int    $campaignId,
+        string $phoneSearch
+    ): array {
+        $conditions = [];
+        $params     = [];
+
+        if ($dateFrom !== '' && strtotime($dateFrom)) {
+            $conditions[] = 'ca.dialed_at >= ?';
+            $params[]     = $dateFrom . ' 00:00:00';
+        }
+
+        if ($dateTo !== '' && strtotime($dateTo)) {
+            $conditions[] = 'ca.dialed_at <= ?';
+            $params[]     = $dateTo . ' 23:59:59';
+        }
+
+        if ($campaignId > 0) {
+            $conditions[] = 'ca.campaign_id = ?';
+            $params[]     = $campaignId;
+        }
+
+        if ($phoneSearch !== '') {
+            $conditions[] = 'l.phone_number LIKE ?';
+            $params[]     = '%' . $phoneSearch . '%';
+        }
+
+        $whereSql = $conditions ? 'WHERE ' . implode(' AND ', $conditions) : '';
+
+        return [$whereSql, $params];
+    }
 
     /**
      * Build a safe parameterised WHERE clause from the active filters.
