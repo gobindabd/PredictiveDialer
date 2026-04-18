@@ -285,6 +285,19 @@ class PhpDialerEngine
 
     private function handleHangup(array $event): void
     {
+        // When Asterisk originates through a Local/ channel, the OriginateResponse
+        // returns the Local channel's Uniqueid (stored as asterisk_uniqueid).
+        // The actual SIP leg hangs up with a *different* Uniqueid but the same
+        // Linkedid, which equals the Local channel's Uniqueid.
+        // Match on EITHER so we close the call regardless of which leg fires first.
+        $uniqueid  = (string) ($event['Uniqueid']  ?? '');
+        $linkedid  = (string) ($event['Linkedid']  ?? '');
+        $cause     = $event['Cause-txt'] ?? ($event['Cause'] ?? null);
+
+        if ($uniqueid === '' && $linkedid === '') {
+            return;
+        }
+
         $this->db->execute(
             <<<'SQL'
             UPDATE calls
@@ -293,15 +306,18 @@ class PhpDialerEngine
                     WHEN status = 'ringing' THEN 'no_answer'
                     ELSE status
                 END,
-                ended_at = COALESCE(ended_at, NOW()),
+                ended_at     = COALESCE(ended_at, NOW()),
                 hangup_cause = ?,
                 duration_sec = TIMESTAMPDIFF(SECOND, dialed_at, NOW()),
-                billsec = CASE WHEN answered_at IS NULL THEN 0 ELSE TIMESTAMPDIFF(SECOND, answered_at, NOW()) END,
-                updated_at = NOW()
-            WHERE asterisk_uniqueid = ?
-              AND ended_at IS NULL
+                billsec      = CASE
+                    WHEN answered_at IS NULL THEN 0
+                    ELSE TIMESTAMPDIFF(SECOND, answered_at, NOW())
+                END,
+                updated_at   = NOW()
+            WHERE ended_at IS NULL
+              AND (asterisk_uniqueid = ? OR asterisk_uniqueid = ?)
             SQL,
-            [$event['Cause-txt'] ?? ($event['Cause'] ?? null), $event['Uniqueid'] ?? '']
+            [$cause, $uniqueid, $linkedid]
         );
     }
 
