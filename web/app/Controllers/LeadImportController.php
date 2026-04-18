@@ -39,9 +39,19 @@ class LeadImportController extends Controller
             [$campaignId, $file['name'], $stored, $this->currentUser()['id'] ?? null]
         );
 
-        $service = new CsvLeadImportService($this->db);
-        $service->validateAndImport($campaignId, $importId, $target);
-
-        header('Location: /campaigns/show?id=' . $campaignId);
+        try {
+            $result = (new CsvLeadImportService($this->db))->validateAndImport($campaignId, $importId, $target);
+            $msg = $result['valid'] . ' lead' . ($result['valid'] !== 1 ? 's' : '') . ' imported';
+            if ($result['invalid'] > 0) {
+                $msg .= ', ' . $result['invalid'] . ' skipped (see errors below)';
+            }
+            header('Location: /campaigns/show?id=' . $campaignId . '&notice=' . urlencode($msg));
+        } catch (\Throwable $e) {
+            $this->db->execute(
+                "UPDATE lead_imports SET status = 'failed', error_message = ?, completed_at = NOW() WHERE id = ?",
+                [substr($e->getMessage(), 0, 500), $importId]
+            );
+            header('Location: /campaigns/show?id=' . $campaignId . '&error=' . urlencode('Import failed: ' . $e->getMessage()));
+        }
     }
 }

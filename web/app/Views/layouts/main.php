@@ -62,10 +62,25 @@ $navItems = [
         .form-control, .form-select { border-radius: 8px; border-color: #cbd5e1; min-height: 44px; }
         .form-control:focus, .form-select:focus { border-color: var(--accent); box-shadow: 0 0 0 .2rem rgba(20,115,134,.12); }
         .btn { border-radius: 8px; font-weight: 700; }
+        button, .button {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 5px 13px;
+            font-size: 13px;
+            font-weight: 700;
+            line-height: 1.4;
+            border: 1px solid transparent;
+            border-radius: 6px;
+            cursor: pointer;
+            text-decoration: none;
+            white-space: nowrap;
+            vertical-align: middle;
+        }
         .btn-primary, button, .button { background: var(--accent); color: white; border-color: var(--accent); }
         .btn-outline-primary, button.secondary, .button.secondary { background: white; color: var(--accent); border-color: var(--accent); }
-        button.danger { background: var(--danger); border-color: var(--danger); }
-        form.inline { display: inline; }
+        button.danger { background: var(--danger); border-color: var(--danger); color: white; }
+        form.inline { display: inline-flex; align-items: center; }
         .page-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 22px; }
         .subtle { color: var(--muted); }
         .panel { background: var(--panel); border: 1px solid #e4e7ec; border-radius: 8px; padding: 24px; margin-bottom: 22px; box-shadow: 0 10px 30px rgba(16,24,40,.04); }

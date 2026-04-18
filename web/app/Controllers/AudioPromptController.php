@@ -24,10 +24,13 @@ class AudioPromptController extends Controller
         $this->requireRole(['admin', 'manager']);
         Csrf::verify($_POST['_csrf'] ?? null);
 
-        $service = new AudioPromptService($this->db, $this->config);
-        $service->store($_FILES['prompt_file'] ?? [], trim((string) $_POST['name']), (int) ($this->currentUser()['id'] ?? 0));
-
-        header('Location: /prompts?notice=' . urlencode('Prompt uploaded successfully.'));
+        try {
+            $service = new AudioPromptService($this->db, $this->config);
+            $service->store($_FILES['prompt_file'] ?? [], trim((string) $_POST['name']), (int) ($this->currentUser()['id'] ?? 0));
+            header('Location: /prompts?notice=' . urlencode('Prompt uploaded successfully.'));
+        } catch (\Throwable $e) {
+            header('Location: /prompts?error=' . urlencode($e->getMessage()));
+        }
     }
 
     /**

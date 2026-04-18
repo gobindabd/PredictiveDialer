@@ -32,9 +32,12 @@ class VendorController extends Controller
         $this->requireRole(['admin']);
         Csrf::verify($_POST['_csrf'] ?? null);
 
-        (new VendorService($this->db))->create($_POST, $this->config);
-
-        header('Location: /vendors?notice=' . urlencode('Trunk saved.'));
+        try {
+            (new VendorService($this->db))->create($_POST, $this->config);
+            header('Location: /vendors?notice=' . urlencode('Trunk saved.'));
+        } catch (\Throwable $e) {
+            header('Location: /vendors?error=' . urlencode($e->getMessage()));
+        }
     }
 
     public function update(): void
@@ -42,8 +45,12 @@ class VendorController extends Controller
         $this->requireRole(['admin']);
         Csrf::verify($_POST['_csrf'] ?? null);
 
-        (new VendorService($this->db))->update((int) ($_POST['vendor_id'] ?? 0), $_POST, $this->config);
-
-        header('Location: /vendors?notice=' . urlencode('Trunk updated.'));
+        $id = (int) ($_POST['vendor_id'] ?? 0);
+        try {
+            (new VendorService($this->db))->update($id, $_POST, $this->config);
+            header('Location: /vendors?notice=' . urlencode('Trunk updated.'));
+        } catch (\Throwable $e) {
+            header('Location: /vendors/edit?id=' . $id . '&error=' . urlencode($e->getMessage()));
+        }
     }
 }

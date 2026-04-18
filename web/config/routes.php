@@ -33,6 +33,7 @@ return function ($router): void {
     $router->post('/leads/update',          LeadController::class,       'update');
     $router->post('/leads/reset',           LeadController::class,       'reset');
     $router->post('/leads/reset-campaign',  LeadController::class,       'resetCampaign');
+    $router->post('/leads/delete',          LeadController::class,       'delete');
 
     // Trunks (vendors)
     $router->get('/vendors',        VendorController::class, 'index');

@@ -69,9 +69,10 @@ class DashboardService
                 vendors.name AS vendor_name
             FROM calls
             JOIN campaigns ON campaigns.id = calls.campaign_id
-            JOIN leads ON leads.id = calls.lead_id
+            JOIN leads     ON leads.id     = calls.lead_id
             LEFT JOIN vendors ON vendors.id = calls.vendor_id
             WHERE calls.status IN ('initiated','ringing','answered','playing_prompt','collecting_dtmf')
+              AND calls.ended_at IS NULL
             ORDER BY calls.dialed_at DESC
             LIMIT 200
             SQL

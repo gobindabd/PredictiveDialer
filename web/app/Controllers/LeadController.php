@@ -67,4 +67,20 @@ class LeadController extends Controller
 
         header('Location: /campaigns/show?id=' . $campaignId . '&notice=' . urlencode($count . ' leads reset'));
     }
+
+    public function delete(): void
+    {
+        $this->requireRole(['admin', 'manager']);
+        Csrf::verify($_POST['_csrf'] ?? null);
+
+        $leadId = (int) ($_POST['lead_id'] ?? 0);
+        $campaignId = (int) ($_POST['campaign_id'] ?? 0);
+
+        try {
+            (new LeadService($this->db))->delete($leadId);
+            header('Location: /campaigns/show?id=' . $campaignId . '&notice=lead-deleted');
+        } catch (\Throwable $e) {
+            header('Location: /campaigns/show?id=' . $campaignId . '&error=' . urlencode($e->getMessage()));
+        }
+    }
 }

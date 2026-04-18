@@ -7,6 +7,10 @@ use App\Core\Router;
 
 ini_set('session.cookie_httponly', '1');
 ini_set('session.cookie_samesite', 'Lax');
+// Enable Secure flag when the request arrives over HTTPS.
+if (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') {
+    ini_set('session.cookie_secure', '1');
+}
 session_start();
 
 spl_autoload_register(function (string $class): void {

@@ -43,13 +43,26 @@ class CampaignController extends Controller
     public function show(): void
     {
         $this->requireAuth();
-        $id = (int) ($_GET['id'] ?? 0);
-        $campaign = $this->db->fetch("SELECT * FROM campaigns WHERE id = ?", [$id]);
+        $id      = (int) ($_GET['id'] ?? 0);
+        $perPage = 50;
+        $page    = max(1, (int) ($_GET['page'] ?? 1));
+        $offset  = ($page - 1) * $perPage;
+
+        $campaign = $this->db->fetch(
+            <<<'SQL'
+            SELECT c.*, v.name AS vendor_name
+            FROM campaigns c
+            LEFT JOIN vendors v ON v.id = c.vendor_id
+            WHERE c.id = ?
+            SQL,
+            [$id]
+        );
         if (!$campaign) {
             http_response_code(404);
             echo 'Campaign not found';
             return;
         }
+
         $errors = $this->db->fetchAll(
             <<<'SQL'
             SELECT e.*
@@ -80,37 +93,50 @@ class CampaignController extends Controller
             [$id]
         ) ?: [];
 
+        $totalLeads = (int) ($stats['total'] ?? 0);
+        $totalPages = max(1, (int) ceil($totalLeads / $perPage));
+        $page       = min($page, $totalPages);
+        $offset     = ($page - 1) * $perPage;
+
         $leads = $this->db->fetchAll(
             <<<'SQL'
             SELECT
                 leads.*,
-                (
-                    SELECT COUNT(*)
-                    FROM calls
-                    WHERE calls.lead_id = leads.id
-                ) AS call_count,
-                (
-                    SELECT calls.failure_reason
-                    FROM calls
-                    WHERE calls.lead_id = leads.id
-                    ORDER BY calls.dialed_at DESC
-                    LIMIT 1
-                ) AS last_failure_reason
+                COALESCE(agg.call_count, 0)    AS call_count,
+                agg.last_failure_reason
             FROM leads
+            LEFT JOIN (
+                SELECT
+                    c.lead_id,
+                    COUNT(*)                   AS call_count,
+                    MAX(IF(c.dialed_at = mx.max_dialed, c.failure_reason, NULL))
+                                               AS last_failure_reason
+                FROM calls c
+                INNER JOIN (
+                    SELECT lead_id, MAX(dialed_at) AS max_dialed
+                    FROM calls
+                    GROUP BY lead_id
+                ) mx ON mx.lead_id = c.lead_id
+                GROUP BY c.lead_id
+            ) agg ON agg.lead_id = leads.id
             WHERE leads.campaign_id = ?
             ORDER BY leads.id DESC
-            LIMIT 250
+            LIMIT ? OFFSET ?
             SQL,
-            [$id]
+            [$id, $perPage, $offset]
         );
 
         $this->view('campaigns/show', [
-            'campaign' => $campaign,
-            'errors' => $errors,
-            'stats' => $stats,
-            'leads' => $leads,
-            'notice' => $_GET['notice'] ?? null,
-            'error' => $_GET['error'] ?? null,
+            'campaign'   => $campaign,
+            'errors'     => $errors,
+            'stats'      => $stats,
+            'leads'      => $leads,
+            'page'       => $page,
+            'perPage'    => $perPage,
+            'totalPages' => $totalPages,
+            'totalLeads' => $totalLeads,
+            'notice'     => $_GET['notice'] ?? null,
+            'error'      => $_GET['error'] ?? null,
         ]);
     }
 }

@@ -131,6 +131,25 @@ class LeadService
         );
     }
 
+    public function delete(int $leadId): void
+    {
+        $lead = $this->find($leadId);
+        if (!$lead) {
+            throw new RuntimeException('Lead not found.');
+        }
+
+        if ($this->hasActiveCall($leadId)) {
+            throw new RuntimeException('Cannot delete a lead while it has an active call.');
+        }
+
+        $this->db->transaction(function (Database $db) use ($leadId): void {
+            // Remove DTMF records first (FK → calls), then calls (FK → leads), then the lead.
+            $db->execute("DELETE cd FROM call_dtmf cd JOIN calls c ON c.id = cd.call_id WHERE c.lead_id = ?", [$leadId]);
+            $db->execute("DELETE FROM calls WHERE lead_id = ?", [$leadId]);
+            $db->execute("DELETE FROM leads WHERE id = ?", [$leadId]);
+        });
+    }
+
     public function find(int $leadId): ?array
     {
         return $this->db->fetch(

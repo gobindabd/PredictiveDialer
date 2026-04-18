@@ -13,9 +13,13 @@ class CampaignApiController extends Controller
         $this->requireRole(['admin', 'manager']);
         Csrf::verify($_POST['_csrf'] ?? null);
         $id = (int) ($_POST['campaign_id'] ?? 0);
-        $service = new CampaignService($this->db);
-        $service->changeStatus($id, $status, (int) ($this->currentUser()['id'] ?? 0));
-        $this->json(['ok' => true, 'campaign_id' => $id, 'status' => $status]);
+
+        try {
+            (new CampaignService($this->db))->changeStatus($id, $status, (int) ($this->currentUser()['id'] ?? 0));
+            $this->json(['ok' => true, 'campaign_id' => $id, 'status' => $status]);
+        } catch (\Throwable $e) {
+            $this->json(['ok' => false, 'error' => $e->getMessage()], 422);
+        }
     }
 
     public function start(): void

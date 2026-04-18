@@ -8,6 +8,7 @@ use Throwable;
 class PhpDialerEngine
 {
     private bool $running = true;
+    private float $lastHeartbeatAt = 0.0;
 
     public function __construct(
         private Database $db,
@@ -325,6 +326,7 @@ class PhpDialerEngine
 
     private function reconcileStaleCalls(): void
     {
+        // Unanswered calls stuck in initiated/ringing for more than 3 minutes.
         $this->db->execute(
             <<<'SQL'
             UPDATE calls
@@ -332,11 +334,29 @@ class PhpDialerEngine
                 ended_at = NOW(),
                 duration_sec = TIMESTAMPDIFF(SECOND, dialed_at, NOW()),
                 billsec = 0,
-                failure_reason = 'stale unanswered call reconciled by PHP engine',
+                failure_reason = 'stale unanswered call reconciled by engine',
                 updated_at = NOW()
             WHERE status IN ('initiated','ringing')
               AND answered_at IS NULL
               AND dialed_at < DATE_SUB(NOW(), INTERVAL 3 MINUTE)
+            SQL
+        );
+
+        // Answered calls still marked active after 2 hours — the Hangup AMI event
+        // was never received (e.g. socket drop during reconnect). Mark them completed
+        // so they no longer appear in the live monitor and stop blocking campaign completion.
+        $this->db->execute(
+            <<<'SQL'
+            UPDATE calls
+            SET status = 'completed',
+                ended_at = COALESCE(ended_at, NOW()),
+                duration_sec = TIMESTAMPDIFF(SECOND, dialed_at, NOW()),
+                billsec = TIMESTAMPDIFF(SECOND, answered_at, NOW()),
+                failure_reason = 'stale answered call reconciled by engine (hangup event missed)',
+                updated_at = NOW()
+            WHERE status IN ('answered','playing_prompt','collecting_dtmf')
+              AND answered_at IS NOT NULL
+              AND answered_at < DATE_SUB(NOW(), INTERVAL 2 HOUR)
             SQL
         );
     }
@@ -434,16 +454,25 @@ class PhpDialerEngine
 
     private function heartbeat(string $status, array $metadata = []): void
     {
+        $now = microtime(true);
+        // Write at most once per second; always write on status transitions
+        // (starting / stopping / degraded) so health monitors see them promptly.
+        $isTransition = in_array($status, ['starting', 'stopping', 'stopped', 'degraded'], true);
+        if (!$isTransition && ($now - $this->lastHeartbeatAt) < 1.0) {
+            return;
+        }
+        $this->lastHeartbeatAt = $now;
+
         $this->db->execute(
             <<<'SQL'
             INSERT INTO engine_heartbeats (engine_id, hostname, pid, status, last_seen_at, metadata)
             VALUES (?, ?, ?, ?, NOW(), ?)
             ON DUPLICATE KEY UPDATE
-                hostname = VALUES(hostname),
-                pid = VALUES(pid),
-                status = VALUES(status),
+                hostname     = VALUES(hostname),
+                pid          = VALUES(pid),
+                status       = VALUES(status),
                 last_seen_at = VALUES(last_seen_at),
-                metadata = VALUES(metadata)
+                metadata     = VALUES(metadata)
             SQL,
             [$this->engineId, gethostname() ?: 'localhost', (int) (getmypid() ?: 0), $status, json_encode($metadata)]
         );
