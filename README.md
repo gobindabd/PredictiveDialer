@@ -22,9 +22,9 @@ PHP is the only application language in this project.
 
 The importer accepts common Bangladesh formats and stores canonical numbers as digits:
 
-- `01720039748` -> `8801720039748`
-- `+8801720039748` -> `8801720039748`
-- `8801720039748` -> `8801720039748`
+- `01721111111` -> `8801721111111`
+- `+8801721111111` -> `8801721111111`
+- `8801721111111` -> `8801721111111`
 
 ## Test
 
