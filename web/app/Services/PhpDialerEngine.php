@@ -225,11 +225,24 @@ class PhpDialerEngine
 
     private function handleOriginateResponse(array $event): void
     {
-        $actionId = $event['ActionID'] ?? '';
+        $actionId  = $event['ActionID'] ?? '';
+        $uniqueid  = ($event['Uniqueid'] ?? '') !== '' ? $event['Uniqueid'] : null;
+
         if (($event['Response'] ?? '') === 'Success') {
+            // Always save the uniqueid when we have one, even if PredictiveAnswered
+            // already advanced the call past 'initiated' (race condition: fast
+            // machine-answers can deliver the UserEvent before OriginateResponse).
+            // Only update status→ringing when the call is still in 'initiated'.
             $this->db->execute(
-                "UPDATE calls SET status = 'ringing', asterisk_uniqueid = ?, updated_at = NOW() WHERE originate_action_id = ? AND status = 'initiated'",
-                [$event['Uniqueid'] ?? null, $actionId]
+                <<<'SQL'
+                UPDATE calls
+                SET asterisk_uniqueid = COALESCE(asterisk_uniqueid, ?),
+                    status            = CASE WHEN status = 'initiated' THEN 'ringing' ELSE status END,
+                    updated_at        = NOW()
+                WHERE originate_action_id = ?
+                  AND status IN ('initiated','ringing','answered','playing_prompt','collecting_dtmf')
+                SQL,
+                [$uniqueid, $actionId]
             );
             return;
         }
