@@ -418,14 +418,21 @@ class PhpDialerEngine
         // never stored (engine crashed between originate and OriginateResponse,
         // or Asterisk returned an empty Uniqueid), the Hangup can never close the
         // call — it will block capacity forever.  Clean up after 10 minutes.
-        // Cap billsec at 300 s so an abnormally long-stuck call never inflates reports.
+        // Cap billsec at 120 s (matches dialplan TIMEOUT(absolute)=120) and derive
+        // ended_at from answered_at + billsec — NOT from NOW() — so that a late-
+        // firing reconciler never stores an inflated ended_at in the database.
         $this->db->execute(
             <<<'SQL'
             UPDATE calls
-            SET status       = 'completed',
-                ended_at     = COALESCE(ended_at, NOW()),
-                duration_sec = TIMESTAMPDIFF(SECOND, dialed_at, NOW()),
-                billsec      = LEAST(TIMESTAMPDIFF(SECOND, answered_at, NOW()), 120),
+            SET billsec      = LEAST(TIMESTAMPDIFF(SECOND, answered_at, NOW()), 120),
+                ended_at     = COALESCE(ended_at,
+                                   DATE_ADD(answered_at,
+                                       INTERVAL LEAST(TIMESTAMPDIFF(SECOND, answered_at, NOW()), 120) SECOND)),
+                duration_sec = TIMESTAMPDIFF(SECOND, dialed_at,
+                                   COALESCE(ended_at,
+                                       DATE_ADD(answered_at,
+                                           INTERVAL LEAST(TIMESTAMPDIFF(SECOND, answered_at, NOW()), 120) SECOND))),
+                status       = 'completed',
                 failure_reason = 'stale call reconciled (no uniqueid — hangup event unmatchable)',
                 updated_at   = NOW()
             WHERE status IN ('answered','playing_prompt','collecting_dtmf')
@@ -440,13 +447,20 @@ class PhpDialerEngine
         // AMI socket was dead during the call and was reconnected — old events
         // are lost).  Frees capacity and prevents the live monitor from showing
         // phantom active calls.
+        // Same ended_at derivation as clause 2: anchor to answered_at + billsec,
+        // never to the reconciler's wall-clock time.
         $this->db->execute(
             <<<'SQL'
             UPDATE calls
-            SET status       = 'completed',
-                ended_at     = COALESCE(ended_at, NOW()),
-                duration_sec = TIMESTAMPDIFF(SECOND, dialed_at, NOW()),
-                billsec      = LEAST(TIMESTAMPDIFF(SECOND, answered_at, NOW()), 120),
+            SET billsec      = LEAST(TIMESTAMPDIFF(SECOND, answered_at, NOW()), 120),
+                ended_at     = COALESCE(ended_at,
+                                   DATE_ADD(answered_at,
+                                       INTERVAL LEAST(TIMESTAMPDIFF(SECOND, answered_at, NOW()), 120) SECOND)),
+                duration_sec = TIMESTAMPDIFF(SECOND, dialed_at,
+                                   COALESCE(ended_at,
+                                       DATE_ADD(answered_at,
+                                           INTERVAL LEAST(TIMESTAMPDIFF(SECOND, answered_at, NOW()), 120) SECOND))),
+                status       = 'completed',
                 failure_reason = 'stale answered call reconciled by engine (hangup event missed)',
                 updated_at   = NOW()
             WHERE status IN ('answered','playing_prompt','collecting_dtmf')
