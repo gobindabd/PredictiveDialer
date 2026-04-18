@@ -10,6 +10,25 @@ class PhpDialerEngine
     private bool $running = true;
     private float $lastHeartbeatAt = 0.0;
 
+    /**
+     * Hangup events that found no matching call row, keyed by both the
+     * channel Uniqueid and its Linkedid so that handleOriginateResponse()
+     * can replay them once asterisk_uniqueid is finally stored.
+     *
+     * Root cause this fixes: when a Local/ channel call ends very quickly
+     * (answer-machine, immediate rejection), the AMI event ordering is
+     *   PredictiveAnswered → Hangup → OriginateResponse
+     * Hangup fires while asterisk_uniqueid is still NULL, so the WHERE
+     * clause finds nothing.  OriginateResponse then saves the uniqueid and
+     * the call is stuck as 'answered' / ended_at=NULL forever, blocking
+     * dialCapacity() and stopping all further dialing.
+     *
+     * Each entry: [ 'event' => array, 'ts' => float (microtime) ]
+     *
+     * @var array<string, array{event: array<string,string>, ts: float}>
+     */
+    private array $pendingHangups = [];
+
     public function __construct(
         private Database $db,
         private AmiClient $ami,
@@ -261,14 +280,14 @@ class PhpDialerEngine
 
     private function handleOriginateResponse(array $event): void
     {
-        $actionId  = $event['ActionID'] ?? '';
-        $uniqueid  = ($event['Uniqueid'] ?? '') !== '' ? $event['Uniqueid'] : null;
+        $actionId = $event['ActionID'] ?? '';
+        $uniqueid = ($event['Uniqueid'] ?? '') !== '' ? $event['Uniqueid'] : null;
 
         if (($event['Response'] ?? '') === 'Success') {
             // Always save the uniqueid when we have one, even if PredictiveAnswered
-            // already advanced the call past 'initiated' (race condition: fast
-            // machine-answers can deliver the UserEvent before OriginateResponse).
-            // Only update status→ringing when the call is still in 'initiated'.
+            // already advanced the call past 'initiated' (race: fast machine-answers
+            // deliver UserEvent before OriginateResponse).
+            // Only advance status → 'ringing' when still in 'initiated'.
             $this->db->execute(
                 <<<'SQL'
                 UPDATE calls
@@ -280,6 +299,32 @@ class PhpDialerEngine
                 SQL,
                 [$uniqueid, $actionId]
             );
+
+            // ── Replay any parked Hangup ──────────────────────────────────────
+            // If a Hangup arrived before this OriginateResponse, handleHangup()
+            // couldn't match the call (asterisk_uniqueid was NULL at the time)
+            // and parked the event in $pendingHangups keyed by the channel
+            // Uniqueid/Linkedid.  Now that the uniqueid is saved, replay it so
+            // the call is closed correctly instead of being stuck as 'answered'.
+            if ($uniqueid !== null && isset($this->pendingHangups[$uniqueid])) {
+                $entry       = $this->pendingHangups[$uniqueid];
+                $pendingEvent = $entry['event'];
+
+                // Remove ALL keys that referenced this same parked event so we
+                // don't accidentally replay it again via the other key.
+                unset($this->pendingHangups[$uniqueid]);
+                $origUid = $pendingEvent['Uniqueid'] ?? '';
+                $origLid = $pendingEvent['Linkedid'] ?? '';
+                if ($origUid !== '' && $origUid !== $uniqueid) {
+                    unset($this->pendingHangups[$origUid]);
+                }
+                if ($origLid !== '' && $origLid !== $uniqueid) {
+                    unset($this->pendingHangups[$origLid]);
+                }
+
+                $this->handleHangup($pendingEvent, true);
+            }
+
             return;
         }
 
@@ -317,42 +362,59 @@ class PhpDialerEngine
     {
         $status = strtoupper((string) ($event['DialStatus'] ?? ''));
         $mapped = [
-            'BUSY' => 'busy',
-            'NOANSWER' => 'no_answer',
-            'CANCEL' => 'cancelled',
+            'BUSY'       => 'busy',
+            'NOANSWER'   => 'no_answer',
+            'CANCEL'     => 'cancelled',
             'CONGESTION' => 'failed',
             'CHANUNAVAIL' => 'failed',
         ][$status] ?? null;
 
         if ($mapped) {
+            // ended_at IS NULL guard: do not re-open a call that Hangup already closed.
             $this->db->execute(
-                "UPDATE calls SET status = ?, disposition = ?, ended_at = COALESCE(ended_at, NOW()), updated_at = NOW() WHERE asterisk_uniqueid = ? AND status NOT IN ('completed','answered')",
+                "UPDATE calls SET status = ?, disposition = ?, ended_at = COALESCE(ended_at, NOW()), updated_at = NOW() WHERE asterisk_uniqueid = ? AND ended_at IS NULL AND status NOT IN ('completed','answered')",
                 [$mapped, $status, $event['Uniqueid'] ?? '']
             );
         }
     }
 
-    private function handleHangup(array $event): void
+    /**
+     * @param bool $isReplay True when called from handleOriginateResponse to
+     *                       replay a previously-parked event.  Prevents the
+     *                       handler from re-queuing the event on a second miss.
+     */
+    private function handleHangup(array $event, bool $isReplay = false): void
     {
         // When Asterisk originates through a Local/ channel, the OriginateResponse
-        // returns the Local channel's Uniqueid (stored as asterisk_uniqueid).
-        // The actual SIP leg hangs up with a *different* Uniqueid but the same
-        // Linkedid, which equals the Local channel's Uniqueid.
-        // Match on EITHER so we close the call regardless of which leg fires first.
-        $uniqueid  = (string) ($event['Uniqueid']  ?? '');
-        $linkedid  = (string) ($event['Linkedid']  ?? '');
-        $cause     = $event['Cause-txt'] ?? ($event['Cause'] ?? null);
+        // returns the Local/;1 Uniqueid (stored as asterisk_uniqueid).
+        // The SIP leg hangs up with a *different* Uniqueid but the same Linkedid,
+        // which equals the Local/;1 Uniqueid.  Match on EITHER so we close the
+        // call regardless of which channel leg's Hangup arrives first.
+        $uniqueid = (string) ($event['Uniqueid'] ?? '');
+        $linkedid = (string) ($event['Linkedid'] ?? '');
+        $cause    = $event['Cause-txt'] ?? ($event['Cause'] ?? null);
 
         if ($uniqueid === '' && $linkedid === '') {
             return;
         }
 
-        $this->db->execute(
-            <<<'SQL'
+        // Only add the Linkedid arm when it differs from Uniqueid; otherwise
+        // the placeholder resolves to '' and could match calls with an empty
+        // (non-NULL) asterisk_uniqueid.
+        $useLinkedid = $linkedid !== '' && $linkedid !== $uniqueid;
+
+        $whereIds = $useLinkedid
+            ? '(asterisk_uniqueid = ? OR asterisk_uniqueid = ?)'
+            : 'asterisk_uniqueid = ?';
+
+        $idParams = $useLinkedid ? [$uniqueid, $linkedid] : [$uniqueid];
+
+        $affected = $this->db->execute(
+            <<<SQL
             UPDATE calls
             SET status = CASE
                     WHEN status IN ('answered','playing_prompt','collecting_dtmf') THEN 'completed'
-                    WHEN status = 'ringing' THEN 'no_answer'
+                    WHEN status IN ('ringing','initiated') THEN 'no_answer'
                     ELSE status
                 END,
                 ended_at     = COALESCE(ended_at, NOW()),
@@ -364,10 +426,23 @@ class PhpDialerEngine
                 END,
                 updated_at   = NOW()
             WHERE ended_at IS NULL
-              AND (asterisk_uniqueid = ? OR asterisk_uniqueid = ?)
+              AND $whereIds
             SQL,
-            [$cause, $uniqueid, $linkedid]
+            [$cause, ...$idParams]
         );
+
+        // ── Pending-hangup queue ──────────────────────────────────────────────
+        // If no row matched, asterisk_uniqueid is not stored yet — OriginateResponse
+        // hasn't been processed.  Park this event so handleOriginateResponse()
+        // can replay it the moment the uniqueid is available.
+        // Skip when replaying (isReplay=true) to prevent infinite re-queuing.
+        if ($affected === 0 && !$isReplay) {
+            $entry = ['event' => $event, 'ts' => microtime(true)];
+            $this->pendingHangups[$uniqueid] = $entry;
+            if ($useLinkedid) {
+                $this->pendingHangups[$linkedid] = $entry;
+            }
+        }
     }
 
     private function failByActionId(string $actionId, string $reason): void
@@ -392,96 +467,72 @@ class PhpDialerEngine
     private function reconcileStaleCalls(): void
     {
         // ── 1. Unanswered calls stuck in initiated/ringing ────────────────────
-        // 'initiated' = Originate sent but no OriginateResponse yet.
+        // 'initiated' = Originate sent, no OriginateResponse yet.
         // 'ringing'   = OriginateResponse received, waiting for SIP answer.
-        // The Dial() timeout in the dialplan is 30 s; allow 90 s total as a
-        // generous buffer before declaring the call failed and freeing capacity.
-        // (Previously 3 minutes — that 3-minute window blocked the campaign with
-        // max_concurrent_calls=1 for far too long on any silent originate failure.)
+        // Dial() timeout in the dialplan is 30 s; 90 s gives a generous buffer
+        // before we declare the call failed and free the capacity slot.
         $this->db->execute(
             <<<'SQL'
             UPDATE calls
-            SET status       = 'failed',
-                ended_at     = NOW(),
-                duration_sec = TIMESTAMPDIFF(SECOND, dialed_at, NOW()),
-                billsec      = 0,
+            SET status         = 'failed',
+                ended_at       = NOW(),
+                duration_sec   = TIMESTAMPDIFF(SECOND, dialed_at, NOW()),
+                billsec        = 0,
                 failure_reason = 'stale unanswered call reconciled by engine',
-                updated_at   = NOW()
+                updated_at     = NOW()
             WHERE status IN ('initiated','ringing')
               AND answered_at IS NULL
               AND dialed_at < DATE_SUB(NOW(), INTERVAL 90 SECOND)
             SQL
         );
 
-        // ── 2. Answered calls with NULL asterisk_uniqueid ─────────────────────
-        // The Hangup event is matched by asterisk_uniqueid.  If the uniqueid was
-        // never stored (engine crashed between originate and OriginateResponse,
-        // or Asterisk returned an empty Uniqueid), the Hangup can never close the
-        // call — it will block capacity forever.  Clean up after 10 minutes.
-        // Cap billsec at 120 s (matches dialplan TIMEOUT(absolute)=120) and derive
-        // ended_at from answered_at + billsec — NOT from NOW() — so that a late-
-        // firing reconciler never stores an inflated ended_at in the database.
+        // ── 2. Answered calls open for more than 5 minutes ───────────────────
+        // The dialplan sets TIMEOUT(absolute)=120 s, so no real call can last
+        // more than 2 minutes.  Any answered call still open after 5 minutes
+        // definitively missed its Hangup event — either because:
+        //   a) asterisk_uniqueid was never stored (engine crashed before
+        //      OriginateResponse; Hangup can never match by uniqueid), or
+        //   b) the engine was restarted and the Hangup was lost from the AMI
+        //      socket buffer during reconnect.
+        // The pendingHangups mechanism handles case (a) within the same engine
+        // process.  This clause is the safety net for engine restarts and any
+        // other scenario where the in-process replay couldn't fire.
+        //
+        // ended_at is anchored to answered_at + actual billsec (not NOW()) so
+        // that a late-firing reconciler never inflates report totals.
         $this->db->execute(
             <<<'SQL'
             UPDATE calls
-            SET billsec      = LEAST(TIMESTAMPDIFF(SECOND, answered_at, NOW()), 120),
-                ended_at     = COALESCE(ended_at,
-                                   DATE_ADD(answered_at,
-                                       INTERVAL LEAST(TIMESTAMPDIFF(SECOND, answered_at, NOW()), 120) SECOND)),
-                duration_sec = TIMESTAMPDIFF(SECOND, dialed_at,
-                                   COALESCE(ended_at,
-                                       DATE_ADD(answered_at,
-                                           INTERVAL LEAST(TIMESTAMPDIFF(SECOND, answered_at, NOW()), 120) SECOND))),
-                status       = 'completed',
-                failure_reason = 'stale call reconciled (no uniqueid — hangup event unmatchable)',
-                updated_at   = NOW()
+            SET billsec        = LEAST(TIMESTAMPDIFF(SECOND, answered_at, NOW()), 120),
+                ended_at       = COALESCE(ended_at,
+                                     DATE_ADD(answered_at,
+                                         INTERVAL LEAST(TIMESTAMPDIFF(SECOND, answered_at, NOW()), 120) SECOND)),
+                duration_sec   = TIMESTAMPDIFF(SECOND, dialed_at,
+                                     COALESCE(ended_at,
+                                         DATE_ADD(answered_at,
+                                             INTERVAL LEAST(TIMESTAMPDIFF(SECOND, answered_at, NOW()), 120) SECOND))),
+                status         = 'completed',
+                failure_reason = 'stale answered call closed by reconciler (hangup missed)',
+                updated_at     = NOW()
             WHERE status IN ('answered','playing_prompt','collecting_dtmf')
               AND answered_at IS NOT NULL
-              AND asterisk_uniqueid IS NULL
-              AND answered_at < DATE_SUB(NOW(), INTERVAL 10 MINUTE)
+              AND answered_at < DATE_SUB(NOW(), INTERVAL 5 MINUTE)
             SQL
         );
 
-        // ── 3. Answered calls with a uniqueid stuck for 2+ hours ──────────────
-        // Safety net: Hangup was received but the uniqueid match failed (e.g.
-        // AMI socket was dead during the call and was reconnected — old events
-        // are lost).  Frees capacity and prevents the live monitor from showing
-        // phantom active calls.
-        // Same ended_at derivation as clause 2: anchor to answered_at + billsec,
-        // never to the reconciler's wall-clock time.
-        $this->db->execute(
-            <<<'SQL'
-            UPDATE calls
-            SET billsec      = LEAST(TIMESTAMPDIFF(SECOND, answered_at, NOW()), 120),
-                ended_at     = COALESCE(ended_at,
-                                   DATE_ADD(answered_at,
-                                       INTERVAL LEAST(TIMESTAMPDIFF(SECOND, answered_at, NOW()), 120) SECOND)),
-                duration_sec = TIMESTAMPDIFF(SECOND, dialed_at,
-                                   COALESCE(ended_at,
-                                       DATE_ADD(answered_at,
-                                           INTERVAL LEAST(TIMESTAMPDIFF(SECOND, answered_at, NOW()), 120) SECOND))),
-                status       = 'completed',
-                failure_reason = 'stale answered call reconciled by engine (hangup event missed)',
-                updated_at   = NOW()
-            WHERE status IN ('answered','playing_prompt','collecting_dtmf')
-              AND answered_at IS NOT NULL
-              AND answered_at < DATE_SUB(NOW(), INTERVAL 2 HOUR)
-            SQL
-        );
-
-        // ── 4. Orphaned 'queued'/'dialing' leads with no open call ────────────
-        // If the engine crashes between leaseLeads() (which sets status='queued')
-        // and originateLead() creating the calls row, or between sending the
-        // AMI originate and updating the lead to 'dialing', the lead is stuck.
-        // releaseLeadsForClosedCalls() can't recover these because there is no
+        // ── 3. Orphaned 'queued'/'dialing' leads with no open call ────────────
+        // If the engine crashes between leaseLeads() (sets status='queued') and
+        // originateLead() creating the calls row, or between the AMI Originate
+        // send and the lead update to 'dialing', the lead is stuck.
+        // releaseLeadsForClosedCalls() cannot recover these because there is no
         // calls row with ended_at IS NOT NULL to JOIN against.
         // Reset after 5 minutes so they are picked up on the next dial cycle.
         $this->db->execute(
             <<<'SQL'
             UPDATE leads
-            SET status    = 'pending',
-                locked_by = NULL,
-                locked_at = NULL,
+            SET status     = 'pending',
+                locked_by  = NULL,
+                locked_at  = NULL,
                 updated_at = NOW()
             WHERE status IN ('queued','dialing')
               AND locked_at < DATE_SUB(NOW(), INTERVAL 5 MINUTE)
@@ -492,6 +543,19 @@ class PhpDialerEngine
               )
             SQL
         );
+
+        // ── 4. Purge stale pending-hangup entries ─────────────────────────────
+        // pendingHangups entries are keyed by AMI channel Uniqueid/Linkedid.
+        // If OriginateResponse never arrives to replay them (e.g. Asterisk
+        // dropped the channel without sending a response), clause 1 above will
+        // already have cleaned up the DB call row.  Remove entries older than
+        // 5 minutes to prevent unbounded memory growth over a long engine run.
+        $hangupCutoff = microtime(true) - 300.0;
+        foreach ($this->pendingHangups as $key => $entry) {
+            if ($entry['ts'] < $hangupCutoff) {
+                unset($this->pendingHangups[$key]);
+            }
+        }
     }
 
     private function releaseLeadsForClosedCalls(): void
