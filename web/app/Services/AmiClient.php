@@ -8,6 +8,13 @@ class AmiClient
 {
     /** @var resource|null */
     private $socket = null;
+
+    /**
+     * Receive buffer — accumulates raw AMI data until complete messages
+     * (delimited by \r\n\r\n) can be parsed out.
+     * Cleared on close() so stale data from a dead connection never bleeds
+     * into a new session.
+     */
     private string $buffer = '';
 
     public function __construct(
@@ -38,15 +45,15 @@ class AmiClient
 
         stream_set_blocking($this->socket, false);
         $this->sendAction([
-            'Action' => 'Login',
+            'Action'   => 'Login',
             'Username' => $this->username,
-            'Secret' => $this->password,
-            'Events' => 'on',
+            'Secret'   => $this->password,
+            'Events'   => 'on',
         ]);
 
         // Wait up to 5 s for the login response and verify it succeeded.
-        $deadline = microtime(true) + 5;
-        $loginBuf = '';
+        $deadline  = microtime(true) + 5;
+        $loginBuf  = '';
         while (microtime(true) < $deadline) {
             $read = [$this->socket];
             $w = $e = null;
@@ -67,12 +74,18 @@ class AmiClient
         if (!str_contains($loginBuf, 'Response: Success')) {
             fclose($this->socket);
             $this->socket = null;
-            throw new RuntimeException('AMI authentication failed. Check AMI username/password in .env and manager.conf.');
+            throw new RuntimeException(
+                'AMI authentication failed. Check AMI username/password in .env and manager.conf.'
+            );
         }
     }
 
     public function close(): void
     {
+        // Always clear the buffer so stale events from the dead connection
+        // are never replayed into the next session after reconnect().
+        $this->buffer = '';
+
         if ($this->socket) {
             try {
                 $this->sendAction(['Action' => 'Logoff']);
@@ -99,9 +112,9 @@ class AmiClient
         string $channel,
         string $context,
         string $extension,
-        int $priority,
-        array $variables,
-        int $timeoutMs = 30000
+        int    $priority,
+        array  $variables,
+        int    $timeoutMs = 30000
     ): void {
         $pairs = [];
         foreach ($variables as $key => $value) {
@@ -111,14 +124,14 @@ class AmiClient
         }
 
         $action = [
-            'Action' => 'Originate',
+            'Action'   => 'Originate',
             'ActionID' => $actionId,
-            'Channel' => $channel,
-            'Context' => $context,
-            'Exten' => $extension,
+            'Channel'  => $channel,
+            'Context'  => $context,
+            'Exten'    => $extension,
             'Priority' => (string) $priority,
-            'Timeout' => (string) $timeoutMs,
-            'Async' => 'true',
+            'Timeout'  => (string) $timeoutMs,
+            'Async'    => 'true',
         ];
 
         if ($pairs) {
@@ -129,39 +142,69 @@ class AmiClient
         $this->sendAction($action);
     }
 
+    /**
+     * Drain the entire AMI socket receive buffer and return all complete events.
+     *
+     * Waits up to $timeoutSeconds for the first byte to arrive (0 = non-blocking),
+     * then reads ALL currently available data in a tight loop so no events are
+     * left sitting in the OS buffer until the next engine cycle.
+     *
+     * @return array<int, array<string, string>>
+     */
     public function readEvents(float $timeoutSeconds = 0.2): array
     {
         if (!$this->socket) {
             return [];
         }
 
+        // Wait for the first byte (or timeout).
         $read = [$this->socket];
-        $write = null;
-        $except = null;
-        $seconds = (int) floor($timeoutSeconds);
-        $microseconds = (int) (($timeoutSeconds - $seconds) * 1000000);
+        $w = $e = null;
+        $sec  = (int) floor($timeoutSeconds);
+        $usec = (int) (($timeoutSeconds - $sec) * 1_000_000);
 
-        $ready = @stream_select($read, $write, $except, $seconds, $microseconds);
-        if ($ready === false || $ready === 0) {
+        if (@stream_select($read, $w, $e, $sec, $usec) <= 0) {
             return [];
         }
 
-        $chunk = fread($this->socket, 65535);
-        if ($chunk === false || $chunk === '') {
-            // Remote end closed the connection; mark socket as dead so the
-            // engine can detect and reconnect on the next cycle.
-            fclose($this->socket);
-            $this->socket = null;
-            return [];
-        }
+        // Drain the entire socket receive buffer — loop until the OS reports
+        // no more data immediately available.  A single fread() of 65 KB can
+        // leave data behind on a busy Asterisk; reading in a tight loop ensures
+        // every pending event is captured in this call rather than being delayed
+        // to the next engine cycle (which would cause OriginateResponse to be
+        // processed after PredictiveAnswered and miss the uniqueid).
+        do {
+            $chunk = fread($this->socket, 65535);
 
-        $this->buffer .= $chunk;
+            if ($chunk === false) {
+                // Hard read error — mark dead.
+                fclose($this->socket);
+                $this->socket = null;
+                break;
+            }
+
+            if ($chunk === '') {
+                // Non-blocking: no more data right now.
+                if (feof($this->socket)) {
+                    fclose($this->socket);
+                    $this->socket = null;
+                }
+                break;
+            }
+
+            $this->buffer .= $chunk;
+
+            // Peek: is more data immediately available?
+            $r = [$this->socket];
+            $w = $e = null;
+        } while ($this->socket !== null && @stream_select($r, $w, $e, 0, 0) > 0);
+
+        // Parse all complete AMI messages out of the buffer.
         $events = [];
-
         while (($pos = strpos($this->buffer, "\r\n\r\n")) !== false) {
-            $raw = substr($this->buffer, 0, $pos);
-            $this->buffer = substr($this->buffer, $pos + 4);
-            $event = $this->parseMessage($raw);
+            $raw           = substr($this->buffer, 0, $pos);
+            $this->buffer  = substr($this->buffer, $pos + 4);
+            $event         = $this->parseMessage($raw);
             if ($event) {
                 $events[] = $event;
             }
@@ -171,8 +214,12 @@ class AmiClient
     }
 
     /**
-     * Send an AMI action. Array values produce one header line per element,
-     * which is required for multi-value fields such as Variable:.
+     * Send an AMI action.
+     *
+     * Handles multi-value fields (e.g. Variable:) by emitting one header line
+     * per array element.  Uses a write loop to handle partial writes on the
+     * non-blocking socket — without this, a large action payload could be
+     * silently truncated when the kernel send buffer is momentarily full.
      */
     private function sendAction(array $action): void
     {
@@ -192,12 +239,18 @@ class AmiClient
         }
         $payload .= "\r\n";
 
-        $written = @fwrite($this->socket, $payload);
-        if ($written === false) {
-            // Mark socket dead so the engine reconnects on the next cycle.
-            fclose($this->socket);
-            $this->socket = null;
-            throw new RuntimeException('AMI write failed — connection lost.');
+        // Write loop: fwrite() on a non-blocking socket may write fewer bytes
+        // than requested when the kernel send buffer is full.
+        $total   = strlen($payload);
+        $written = 0;
+        while ($written < $total) {
+            $sent = @fwrite($this->socket, substr($payload, $written));
+            if ($sent === false || $sent === 0) {
+                fclose($this->socket);
+                $this->socket = null;
+                throw new RuntimeException('AMI write failed — connection lost.');
+            }
+            $written += $sent;
         }
     }
 

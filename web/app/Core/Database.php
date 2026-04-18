@@ -106,15 +106,35 @@ class Database
         return (int) $this->pdo->lastInsertId();
     }
 
+    /**
+     * Run $callback inside a transaction.
+     *
+     * Handles MySQL gone-away on beginTransaction() so a long-idle engine
+     * connection does not crash the entire engine cycle when it tries to
+     * start a new transaction after MySQL's wait_timeout has expired.
+     */
     public function transaction(callable $callback): mixed
     {
-        $this->pdo->beginTransaction();
+        try {
+            $this->pdo->beginTransaction();
+        } catch (PDOException $e) {
+            if ($this->reconnectIfGoneAway($e)) {
+                $this->pdo->beginTransaction();
+            } else {
+                throw $e;
+            }
+        }
+
         try {
             $result = $callback($this);
             $this->pdo->commit();
             return $result;
         } catch (\Throwable $e) {
-            $this->pdo->rollBack();
+            // Guard against double-rollback if the inner callback already
+            // committed or if commit() itself threw after a partial write.
+            if ($this->pdo->inTransaction()) {
+                $this->pdo->rollBack();
+            }
             throw $e;
         }
     }

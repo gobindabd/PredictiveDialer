@@ -34,6 +34,14 @@ class PhpDialerEngine
                     $this->ami->reconnect();
                 }
 
+                // ── Drain AMI events FIRST ────────────────────────────────────
+                // Process all pending events (Hangup, OriginateResponse, etc.)
+                // before running the state machine so that dialCapacity(),
+                // releaseLeadsForClosedCalls(), and completeFinishedCampaigns()
+                // see up-to-date call states.  Use 0-second timeout — just drain
+                // whatever is already in the socket buffer without waiting.
+                $this->processAmiEvents(0.0);
+
                 $this->heartbeat('running');
                 $this->activateDueCampaigns();
                 $this->reconcileStaleCalls();
@@ -41,19 +49,24 @@ class PhpDialerEngine
                 $this->applyStoppingCampaigns();
                 $this->completeFinishedCampaigns();
                 $this->dialRunningCampaigns();
-                $this->processAmiEvents();
+
+                // ── Drain again after dialing ─────────────────────────────────
+                // Give Asterisk a short window to respond with OriginateResponse
+                // and any other events that arrived during this cycle.
+                $this->processAmiEvents(0.2);
+
             } catch (Throwable $e) {
                 $this->heartbeat('degraded', ['error' => $e->getMessage()]);
                 // If AMI write or connect failed, ensure socket is marked dead
                 // so the next iteration triggers a reconnect.
                 if (!$this->ami->isConnected()) {
-                    usleep(3000000);
+                    usleep(3_000_000);
                 } else {
-                    usleep(1000000);
+                    usleep(1_000_000);
                 }
             }
 
-            usleep(500000);
+            usleep(500_000);
         }
 
         $this->heartbeat('stopping');
@@ -207,18 +220,41 @@ class PhpDialerEngine
         }
     }
 
-    private function processAmiEvents(): void
+    /**
+     * Read all pending AMI events and dispatch them to their handlers.
+     *
+     * Each event is wrapped in its own try/catch so that a DB error on one
+     * event (e.g. a duplicate DTMF insert) does not abort processing of the
+     * remaining events in the batch.
+     */
+    private function processAmiEvents(float $timeout = 0.2): void
     {
-        foreach ($this->ami->readEvents(0.2) as $event) {
-            $name = $event['Event'] ?? null;
-            if ($name === 'OriginateResponse') {
-                $this->handleOriginateResponse($event);
-            } elseif ($name === 'UserEvent') {
-                $this->handleUserEvent($event);
-            } elseif ($name === 'DialEnd') {
-                $this->handleDialEnd($event);
-            } elseif ($name === 'Hangup') {
-                $this->handleHangup($event);
+        foreach ($this->ami->readEvents($timeout) as $event) {
+            try {
+                $name = $event['Event'] ?? null;
+                if ($name === 'OriginateResponse') {
+                    $this->handleOriginateResponse($event);
+                } elseif ($name === 'UserEvent') {
+                    $this->handleUserEvent($event);
+                } elseif ($name === 'DialEnd') {
+                    $this->handleDialEnd($event);
+                } elseif ($name === 'Hangup') {
+                    $this->handleHangup($event);
+                }
+            } catch (Throwable $e) {
+                // Log the failure but continue processing the rest of the batch.
+                try {
+                    $this->db->execute(
+                        "INSERT INTO system_logs (level, source, message, context) VALUES ('error', 'dialer-engine', ?, ?)",
+                        [
+                            'AMI event handler error: ' . $e->getMessage(),
+                            json_encode(['event' => $event, 'error' => $e->getMessage()]),
+                        ]
+                    );
+                } catch (Throwable) {
+                    // If even the log insert fails, swallow silently — the outer
+                    // loop will mark the engine degraded on the next cycle.
+                }
             }
         }
     }
@@ -355,35 +391,43 @@ class PhpDialerEngine
 
     private function reconcileStaleCalls(): void
     {
-        // Unanswered calls stuck in initiated/ringing for more than 3 minutes.
+        // ── 1. Unanswered calls stuck in initiated/ringing ────────────────────
+        // 'initiated' = Originate sent but no OriginateResponse yet.
+        // 'ringing'   = OriginateResponse received, waiting for SIP answer.
+        // The Dial() timeout in the dialplan is 30 s; allow 90 s total as a
+        // generous buffer before declaring the call failed and freeing capacity.
+        // (Previously 3 minutes — that 3-minute window blocked the campaign with
+        // max_concurrent_calls=1 for far too long on any silent originate failure.)
         $this->db->execute(
             <<<'SQL'
             UPDATE calls
-            SET status = 'failed',
-                ended_at = NOW(),
+            SET status       = 'failed',
+                ended_at     = NOW(),
                 duration_sec = TIMESTAMPDIFF(SECOND, dialed_at, NOW()),
-                billsec = 0,
+                billsec      = 0,
                 failure_reason = 'stale unanswered call reconciled by engine',
-                updated_at = NOW()
+                updated_at   = NOW()
             WHERE status IN ('initiated','ringing')
               AND answered_at IS NULL
-              AND dialed_at < DATE_SUB(NOW(), INTERVAL 3 MINUTE)
+              AND dialed_at < DATE_SUB(NOW(), INTERVAL 90 SECOND)
             SQL
         );
 
-        // Answered calls with no asterisk_uniqueid stuck for more than 10 minutes.
-        // The Hangup event can never match these (no uniqueid to look up), so clean
-        // them up quickly rather than waiting 2 hours.
-        // Cap billsec at 300 s so a long-stuck call can never produce an absurd duration.
+        // ── 2. Answered calls with NULL asterisk_uniqueid ─────────────────────
+        // The Hangup event is matched by asterisk_uniqueid.  If the uniqueid was
+        // never stored (engine crashed between originate and OriginateResponse,
+        // or Asterisk returned an empty Uniqueid), the Hangup can never close the
+        // call — it will block capacity forever.  Clean up after 10 minutes.
+        // Cap billsec at 300 s so an abnormally long-stuck call never inflates reports.
         $this->db->execute(
             <<<'SQL'
             UPDATE calls
-            SET status = 'completed',
-                ended_at = COALESCE(ended_at, NOW()),
+            SET status       = 'completed',
+                ended_at     = COALESCE(ended_at, NOW()),
                 duration_sec = TIMESTAMPDIFF(SECOND, dialed_at, NOW()),
-                billsec = LEAST(TIMESTAMPDIFF(SECOND, answered_at, NOW()), 300),
+                billsec      = LEAST(TIMESTAMPDIFF(SECOND, answered_at, NOW()), 300),
                 failure_reason = 'stale call reconciled (no uniqueid — hangup event unmatchable)',
-                updated_at = NOW()
+                updated_at   = NOW()
             WHERE status IN ('answered','playing_prompt','collecting_dtmf')
               AND answered_at IS NOT NULL
               AND asterisk_uniqueid IS NULL
@@ -391,22 +435,47 @@ class PhpDialerEngine
             SQL
         );
 
-        // Answered calls still marked active after 2 hours — the Hangup AMI event
-        // was never received (e.g. socket drop during reconnect). Mark them completed
-        // so they no longer appear in the live monitor and stop blocking campaign completion.
-        // Cap billsec at 300 s to avoid absurd durations on very long-stuck calls.
+        // ── 3. Answered calls with a uniqueid stuck for 2+ hours ──────────────
+        // Safety net: Hangup was received but the uniqueid match failed (e.g.
+        // AMI socket was dead during the call and was reconnected — old events
+        // are lost).  Frees capacity and prevents the live monitor from showing
+        // phantom active calls.
         $this->db->execute(
             <<<'SQL'
             UPDATE calls
-            SET status = 'completed',
-                ended_at = COALESCE(ended_at, NOW()),
+            SET status       = 'completed',
+                ended_at     = COALESCE(ended_at, NOW()),
                 duration_sec = TIMESTAMPDIFF(SECOND, dialed_at, NOW()),
-                billsec = LEAST(TIMESTAMPDIFF(SECOND, answered_at, NOW()), 300),
+                billsec      = LEAST(TIMESTAMPDIFF(SECOND, answered_at, NOW()), 300),
                 failure_reason = 'stale answered call reconciled by engine (hangup event missed)',
-                updated_at = NOW()
+                updated_at   = NOW()
             WHERE status IN ('answered','playing_prompt','collecting_dtmf')
               AND answered_at IS NOT NULL
               AND answered_at < DATE_SUB(NOW(), INTERVAL 2 HOUR)
+            SQL
+        );
+
+        // ── 4. Orphaned 'queued'/'dialing' leads with no open call ────────────
+        // If the engine crashes between leaseLeads() (which sets status='queued')
+        // and originateLead() creating the calls row, or between sending the
+        // AMI originate and updating the lead to 'dialing', the lead is stuck.
+        // releaseLeadsForClosedCalls() can't recover these because there is no
+        // calls row with ended_at IS NOT NULL to JOIN against.
+        // Reset after 5 minutes so they are picked up on the next dial cycle.
+        $this->db->execute(
+            <<<'SQL'
+            UPDATE leads
+            SET status    = 'pending',
+                locked_by = NULL,
+                locked_at = NULL,
+                updated_at = NOW()
+            WHERE status IN ('queued','dialing')
+              AND locked_at < DATE_SUB(NOW(), INTERVAL 5 MINUTE)
+              AND NOT EXISTS (
+                  SELECT 1 FROM calls
+                  WHERE calls.lead_id = leads.id
+                    AND calls.ended_at IS NULL
+              )
             SQL
         );
     }
