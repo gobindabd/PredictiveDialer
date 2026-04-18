@@ -374,13 +374,14 @@ class PhpDialerEngine
         // Answered calls with no asterisk_uniqueid stuck for more than 10 minutes.
         // The Hangup event can never match these (no uniqueid to look up), so clean
         // them up quickly rather than waiting 2 hours.
+        // Cap billsec at 300 s so a long-stuck call can never produce an absurd duration.
         $this->db->execute(
             <<<'SQL'
             UPDATE calls
             SET status = 'completed',
                 ended_at = COALESCE(ended_at, NOW()),
                 duration_sec = TIMESTAMPDIFF(SECOND, dialed_at, NOW()),
-                billsec = TIMESTAMPDIFF(SECOND, answered_at, NOW()),
+                billsec = LEAST(TIMESTAMPDIFF(SECOND, answered_at, NOW()), 300),
                 failure_reason = 'stale call reconciled (no uniqueid — hangup event unmatchable)',
                 updated_at = NOW()
             WHERE status IN ('answered','playing_prompt','collecting_dtmf')
@@ -393,13 +394,14 @@ class PhpDialerEngine
         // Answered calls still marked active after 2 hours — the Hangup AMI event
         // was never received (e.g. socket drop during reconnect). Mark them completed
         // so they no longer appear in the live monitor and stop blocking campaign completion.
+        // Cap billsec at 300 s to avoid absurd durations on very long-stuck calls.
         $this->db->execute(
             <<<'SQL'
             UPDATE calls
             SET status = 'completed',
                 ended_at = COALESCE(ended_at, NOW()),
                 duration_sec = TIMESTAMPDIFF(SECOND, dialed_at, NOW()),
-                billsec = TIMESTAMPDIFF(SECOND, answered_at, NOW()),
+                billsec = LEAST(TIMESTAMPDIFF(SECOND, answered_at, NOW()), 300),
                 failure_reason = 'stale answered call reconciled by engine (hangup event missed)',
                 updated_at = NOW()
             WHERE status IN ('answered','playing_prompt','collecting_dtmf')
