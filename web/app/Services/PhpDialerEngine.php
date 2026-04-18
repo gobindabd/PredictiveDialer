@@ -358,6 +358,25 @@ class PhpDialerEngine
             SQL
         );
 
+        // Answered calls with no asterisk_uniqueid stuck for more than 10 minutes.
+        // The Hangup event can never match these (no uniqueid to look up), so clean
+        // them up quickly rather than waiting 2 hours.
+        $this->db->execute(
+            <<<'SQL'
+            UPDATE calls
+            SET status = 'completed',
+                ended_at = COALESCE(ended_at, NOW()),
+                duration_sec = TIMESTAMPDIFF(SECOND, dialed_at, NOW()),
+                billsec = TIMESTAMPDIFF(SECOND, answered_at, NOW()),
+                failure_reason = 'stale call reconciled (no uniqueid — hangup event unmatchable)',
+                updated_at = NOW()
+            WHERE status IN ('answered','playing_prompt','collecting_dtmf')
+              AND answered_at IS NOT NULL
+              AND asterisk_uniqueid IS NULL
+              AND answered_at < DATE_SUB(NOW(), INTERVAL 10 MINUTE)
+            SQL
+        );
+
         // Answered calls still marked active after 2 hours — the Hangup AMI event
         // was never received (e.g. socket drop during reconnect). Mark them completed
         // so they no longer appear in the live monitor and stop blocking campaign completion.
