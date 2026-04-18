@@ -425,7 +425,7 @@ class PhpDialerEngine
             SET status       = 'completed',
                 ended_at     = COALESCE(ended_at, NOW()),
                 duration_sec = TIMESTAMPDIFF(SECOND, dialed_at, NOW()),
-                billsec      = LEAST(TIMESTAMPDIFF(SECOND, answered_at, NOW()), 300),
+                billsec      = LEAST(TIMESTAMPDIFF(SECOND, answered_at, NOW()), 120),
                 failure_reason = 'stale call reconciled (no uniqueid — hangup event unmatchable)',
                 updated_at   = NOW()
             WHERE status IN ('answered','playing_prompt','collecting_dtmf')
@@ -446,7 +446,7 @@ class PhpDialerEngine
             SET status       = 'completed',
                 ended_at     = COALESCE(ended_at, NOW()),
                 duration_sec = TIMESTAMPDIFF(SECOND, dialed_at, NOW()),
-                billsec      = LEAST(TIMESTAMPDIFF(SECOND, answered_at, NOW()), 300),
+                billsec      = LEAST(TIMESTAMPDIFF(SECOND, answered_at, NOW()), 120),
                 failure_reason = 'stale answered call reconciled by engine (hangup event missed)',
                 updated_at   = NOW()
             WHERE status IN ('answered','playing_prompt','collecting_dtmf')
